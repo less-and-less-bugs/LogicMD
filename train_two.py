@@ -326,9 +326,9 @@ if __name__ == '__main__':
     # must record every result
     args = get_parser()
     experiment = Experiment(
-        api_key="QHEvkye6DAyokXa91m6cl2UrX",
-        project_name="LogicDM_Report_Result",
-        workspace="liuhui3",
+        api_key="",
+        project_name="",
+        workspace="",
     )
     experiment.set_name("LogicDM"+str(args.data) + str(args.lr) + str(args.log))
     experiment.add_tag(args.tag)
