@@ -186,8 +186,8 @@ class RFND(nn.Module):
                         tmp = atoms[j][i][flag[i]]
                         if tmp.size(0) == 0:
                             # null find top k
-                            index = self.find_top_k_atoms(final_choose_score[j][i])
-                            tmp = torch.index_select(atoms[j][i], 0, index)
+                            value, index = self.find_top_k_atoms(final_choose_score[j][i])
+                            tmp = torch.index_select(atoms[j][i], 0, index)*value
                         # logic reasoning for per sample per head
                         logic_score.append(tmp)
                 # ansnumber*N
@@ -270,14 +270,14 @@ class RFND(nn.Module):
         N, L = score.shape
         if L < self.top_K:
             # pad for subsequent
-            E_ = torch.cat([E, torch.zeros((N, self.top_K - L, E.size(2)))]).cuda()
+            E_ = torch.cat([E*score, torch.zeros((N, self.top_K - L, E.size(2)))]).cuda()
         else:
             # find top_K_T obtain index
-            tok_K_T = torch.topk(score, self.top_K)[1]
+            values, tok_K_T = torch.topk(score, self.top_K)
             E_ = []
             for i in range(len(tok_K_T)):
                 E_.append(torch.index_select(E[i], 0, tok_K_T[i]))
-            E_ = torch.stack(E_, dim=0).contiguous()
+            E_ = torch.stack(E_, dim=0).contiguous() * values
         mask = None
         return E_, mask
 
@@ -291,8 +291,8 @@ class RFND(nn.Module):
         L = score.size(0)
         top_k = int(L * self.rate)
         # find top_K_T
-        tok_K_T = torch.topk(score, top_k, dim=0)[1]
-        return tok_K_T
+        values, tok_K_T = torch.topk(score, top_k, dim=0)
+        return values, tok_K_T
 
     def bind_relation_instance(self, E_top_k, clues):
         """
