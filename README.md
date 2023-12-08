@@ -8,5 +8,5 @@ Our models are implemented in models/rule_detection.py. To reproduce the results
 
 Since I used comet package in these files, you may remove codes related to this package or just replace my api keys with yours. After that, you can run sarcasm.sh, twitter.sh, and weibo.sh directly. 
 
-Note (2023/12/08): I found some problems in codes, try to fix them in a fewer weeeks.
+Note (2023/12/08): I found some problems in codes, try to fix them in a few weeeks.
 
