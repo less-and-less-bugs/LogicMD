@@ -3,6 +3,9 @@ The official implementation of our paper "Interpretable Multimodal Misinformatio
 
 # Dataset 
 You can download the dataset and the related pre-processing files in this link \url{https://portland-my.sharepoint.com/:u:/g/personal/liuhui3-c_my_cityu_edu_hk/EYR-45i16q9EivlGM1ZCe9cBrPsuOjr8O9fziihKJPLIoA?e=2KVCFW}.
+
+Update:
+This is the new dataset link: https://1drv.ms/u/c/11e65424f2029e02/ETMtRqYt7YhHsL5dcwnIZMYB6ZD05OeLID25MtZrL6SdEA?e=FGDau3
 # Instruction to run our code
 Our models are implemented in models/rule_detection.py. To reproduce the results of experiments, you can use train_sarcasm.py for the Sarcasm dataset and train_two.py for Weibo and Twitter datasets. 
 
