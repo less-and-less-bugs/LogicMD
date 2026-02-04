@@ -118,6 +118,7 @@ class RFND(nn.Module):
         imgs_0 = self.img_encoder(imgs)
         # (N, L, outdim)
         texts_0 = self.text_encoder(encoded_texts, word_spans, word_len)
+        
         r = imgs_0.size(1)
         l = texts_0.size(1)
         # captions_0 = self.text_encoder(encoded_captions, cap_word_spans, cap_word_lens)
@@ -131,6 +132,7 @@ class RFND(nn.Module):
                                                                                                       mask_T=mask_batch_T,
                                                                                                       mask_TT=mask_batch_TT,
                                                                                                   mask_TV=mask_batch_TV)
+            
             # N, self.top_k, A，self.instance_dim
             clues_T = self.bind_relation_instance(E_top_k=E_T_top_k, clues=self.clues_T)
             clues_V = self.bind_relation_instance(E_top_k=E_V_top_k, clues=self.clues_V)
@@ -141,39 +143,58 @@ class RFND(nn.Module):
             # (N,L,A, D)
             E = torch.cat([E_T_top_k, E_V_top_k, E_T_T_top_k, E_T_V_top_k, E_V_V_top_k], dim=1).contiguous().cuda().unsqueeze(2)\
                 .expand(-1, -1, self.ans_number, -1)
+            
             # L = 5*self.top_K
             # N, L, A，self.instance_dim
             predicates = torch.cat([clues_T, clues_V, clues_T_T, clues_T_V,  clues_V_V], dim=1)
+            
             # N, L, A
             del clues_T, clues_V, clues_T_T, clues_T_V,  clues_V_V,E_T_top_k, E_V_top_k, E_T_T_top_k, E_T_V_top_k, E_V_V_top_k
             torch.cuda.empty_cache()
             instance_score_by_ans = self.find_instance_by_answer(E)
+            
             # N, L, A，self.instance_dim
             predicates_set = []
             for i in range(self.ans_number):
                 predicates_ = self.inter_predicates(tgt=predicates[:, :, i, :], src=predicates[:, :, i, :], src_key_padding_mask=None)
                 predicates_set.append(predicates_)
             predicates_ = torch.stack(predicates_set, dim=2)
+            
             # A, N, L
             # E = E * self.answer_set
-            atoms = self.atoms_generation(torch.cat([E, predicates, E - predicates, E * predicates],  dim=-1)).squeeze().permute(2, 0, 1)
+            atoms_input = torch.cat([E, predicates, E - predicates, E * predicates], dim=-1)
+            
+            atoms = self.atoms_generation(atoms_input).squeeze().permute(2, 0, 1)
+            
             # N, L
-            I_score = self.softmax(self.patch_score(imgs_0).squeeze())
-            T_score = self.softmax(self.token_score(texts_0).squeeze())
+            patch_score_raw = self.patch_score(imgs_0).squeeze()
+            token_score_raw = self.token_score(texts_0).squeeze()
+            
+            I_score = self.softmax(patch_score_raw)
+            T_score = self.softmax(token_score_raw)
+            
             # N, D
             I_emb = torch.bmm(imgs_0.permute(0, 2, 1), I_score.unsqueeze(2)).squeeze()
             T_emb = torch.bmm(texts_0.permute(0, 2, 1), T_score.unsqueeze(2)).squeeze()
+            
             # N,instance_dim
-            E_Image_Text = self.linear_T_V(torch.cat([T_emb, I_emb, T_emb*I_emb, T_emb-I_emb], dim=-1))
+            E_Image_Text_input = torch.cat([T_emb, I_emb, T_emb*I_emb, T_emb-I_emb], dim=-1)
+            
+            E_Image_Text = self.linear_T_V(E_Image_Text_input)
+            
             # self.guide_num, l
             multiple_guide_clauses = []
-            for i in range(self.guide_head):
+            for head_i in range(self.guide_head):
                 # (N,L,A) remove instance_score_by_ans*instance_score_by_ans or image+instance+answer
                 # N, L, A
-                final_choose_score = self.sparsemax((self.guide[2*i](predicates_).squeeze())*(
-                    self.guide[2*i+1](E_Image_Text).unsqueeze(2).expand(-1, predicates_.size(1), predicates_.size(2)))) * self.sparsemax(instance_score_by_ans)
+                guide_pred = self.guide[2*head_i](predicates_).squeeze()
+                guide_img_text = self.guide[2*head_i+1](E_Image_Text).unsqueeze(2).expand(-1, predicates_.size(1), predicates_.size(2))
+                
+                final_choose_score = self.sparsemax(guide_pred * guide_img_text) * self.sparsemax(instance_score_by_ans)
+                
                 # (A,N,L)
                 final_choose_score = self.sparsemax(final_choose_score.permute(2, 0, 1))
+                
                 # print(torch.max(final_choose_score, dim=-1))
                 # find atoms that the score is higher than self.threshold.
                 # (A,N,L)
@@ -184,22 +205,41 @@ class RFND(nn.Module):
                     flag = flag_[j]
                     for i in range(flag.size(0)):
                         tmp = atoms[j][i][flag[i]]
+                        
                         if tmp.size(0) == 0:
                             # null find top k
                             value, index = self.find_top_k_atoms(final_choose_score[j][i])
                             tmp = torch.index_select(atoms[j][i], 0, index)*value
+                        
                         # logic reasoning for per sample per head
                         logic_score.append(tmp)
                 # ansnumber*N
                 logic_score = self.conjunction_logic_reasoning(logic_score)
+                
                 # H, N
                 multiple_guide_clauses.append(logic_score)
             # 2N，5
             multiple_guide_clauses = torch.stack(multiple_guide_clauses, dim=1)
+            
             # the maximum probability o 2N
             multiple_guide_clauses = torch.max(multiple_guide_clauses, dim=1)[0]
-            # 2, N
-            gc_clause_list.append(torch.stack(multiple_guide_clauses.chunk(2), dim=0))
+            
+            # Ensure the first dimension is divisible by ans_number for chunk operation
+            # Shape should be (ans_number*N,) where N is batch size
+            # Use view to reshape instead of chunk to avoid dimension mismatch issues
+            if multiple_guide_clauses.dim() == 1 and multiple_guide_clauses.size(0) % self.ans_number == 0:
+                # Reshape to (ans_number, N) directly
+                N = multiple_guide_clauses.size(0) // self.ans_number
+                multiple_guide_clauses = multiple_guide_clauses.view(self.ans_number, N)
+                gc_clause_list.append(multiple_guide_clauses)
+            else:
+                # Fallback to chunk if shape is unexpected, but ensure it's divisible by ans_number
+                if multiple_guide_clauses.size(0) % self.ans_number != 0:
+                    # Pad if necessary (should not happen in normal cases)
+                    pad_size = self.ans_number - (multiple_guide_clauses.size(0) % self.ans_number)
+                    multiple_guide_clauses = torch.cat([multiple_guide_clauses, torch.zeros(pad_size, device=multiple_guide_clauses.device, dtype=multiple_guide_clauses.dtype)], dim=0)
+                # ans_number, N
+                gc_clause_list.append(torch.stack(multiple_guide_clauses.chunk(self.ans_number), dim=0))
             if gc_i != len(self.gc):
                 graph = torch.cat([texts_0, imgs_0], dim=1).cuda()
                 graph = self.gc[gc_i](graph, adj_matrix)
@@ -214,6 +254,7 @@ class RFND(nn.Module):
         # (N, L, O)
         E_T = self.linear_T(texts)
         E_V = self.linear_V(imgs)
+        
         l = texts.size()[1]
         r = imgs.size()[1]
         # N,L,1,D
@@ -239,15 +280,15 @@ class RFND(nn.Module):
             torch.cat([imgs_V_V_1, imgs_V_V_2, imgs_V_V_1 * imgs_V_V_2, imgs_V_V_1 - imgs_V_V_2], dim=-1))
         E_T_T = E_T_T.view(E_T_T.size(0), -1, E_T_T.size(3))
         E_T_V = E_T_V.view(E_T_V.size(0), -1, E_T_V.size(3))
-        E_V_V = E_T_V.view(E_V_V.size(0), -1, E_V_V.size(3))
+        E_V_V = E_V_V.view(E_V_V.size(0), -1, E_V_V.size(3))  # Fixed: was E_T_V.view(...)
         # Find Top_K  need add mask to keep semantic dependency N,L
-        E_T_score = self.linear_T_top_k(E_T).squeeze().masked_fill_(mask_T, float("-Inf"))
+        E_T_score = self.linear_T_top_k(E_T).squeeze().masked_fill(mask_T, float("-Inf"))
         # may add mask afterwards
         E_V_score = self.linear_V_top_k(E_V).squeeze()
         mask_TT = mask_TT.view(E_T_T.size(0), -1)
         mask_TV = mask_TV.view(E_T_V.size(0), -1)
-        E_T_T_score = self.linear_T_T_top_k(E_T_T).squeeze().masked_fill_(mask_TT, float("-Inf"))
-        E_T_V_score = self.linear_T_V_top_k(E_T_V).squeeze().masked_fill_(mask_TV, float("-Inf"))
+        E_T_T_score = self.linear_T_T_top_k(E_T_T).squeeze().masked_fill(mask_TT, float("-Inf"))
+        E_T_V_score = self.linear_T_V_top_k(E_T_V).squeeze().masked_fill(mask_TV, float("-Inf"))
         # may add mask afterwards
         E_V_V_score = self.linear_V_V_top_k(E_V_V).squeeze()
         E_T_top_k, _ = self.find_top_k(score=E_T_score, E=E_T, mask=None)
@@ -266,18 +307,24 @@ class RFND(nn.Module):
         :param mask:
         :return:
         """
-
         N, L = score.shape
         if L < self.top_K:
             # pad for subsequent
-            E_ = torch.cat([E*score, torch.zeros((N, self.top_K - L, E.size(2)))]).cuda()
+            E_scaled = E * score.unsqueeze(-1)
+            E_ = torch.cat([E_scaled, torch.zeros((N, self.top_K - L, E.size(2)), device=E.device, dtype=E.dtype)], dim=1)
         else:
             # find top_K_T obtain index
-            values, tok_K_T = torch.topk(score, self.top_K)
+            values, tok_K_T = torch.topk(score, self.top_K, dim=1)
+            
             E_ = []
             for i in range(len(tok_K_T)):
-                E_.append(torch.index_select(E[i], 0, tok_K_T[i]))
-            E_ = torch.stack(E_, dim=0).contiguous() * values
+                E_selected = torch.index_select(E[i], 0, tok_K_T[i])
+                E_.append(E_selected)
+            E_ = torch.stack(E_, dim=0).contiguous()
+            # Expand values to match E_ dimensions: (N, top_K) -> (N, top_K, 1)
+            values = values.unsqueeze(-1)
+            E_ = E_ * values
+        
         mask = None
         return E_, mask
 
@@ -290,8 +337,11 @@ class RFND(nn.Module):
         """
         L = score.size(0)
         top_k = int(L * self.rate)
+        if top_k == 0:
+            top_k = 1  # Ensure at least 1 element
         # find top_K_T
-        values, tok_K_T = torch.topk(score, top_k, dim=0)
+        values, tok_K_T = torch.topk(score, min(top_k, L), dim=0)
+        
         return values, tok_K_T
 
     def bind_relation_instance(self, E_top_k, clues):
@@ -351,7 +401,7 @@ class RFND(nn.Module):
 
     def conjunction_logic_reasoning(self, logic_score):
         """
-
+        
         :param logic_score:
         :return: (N) dimension tensor
         """
