@@ -4,17 +4,21 @@ import torch
 import os
 import random
 import numpy as np
+import json
 from models import RFND, calculate_probability
 import argparse
 from utils import seed_everything
 from utils import Twitter_Set, Weibo_Set, PadCollate, CompleteLogger, all_metrics
+# from utils.finefake_dataset import FineFake_Set
+from utils.finefake_dataset_v2 import FineFake_Set_V2
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import random_split
 import shutil
 import torch.nn.functional as F
 import time
 from tqdm import tqdm
-from comet_ml import Experiment
+from sklearn.metrics import confusion_matrix
+# from comet_ml import Experiment  # Removed comet.ml dependency
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -26,9 +30,9 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 def get_parser():
     parser = argparse.ArgumentParser(description='Multimodal TextCnn')
     # dataset parameters and log parameter
-    parser.add_argument('-d', '--data', metavar='DATA', default='twitter', choices=['weibo', 'twitter'],
-                        help='dataset: weibo, twitter')
-    parser.add_argument('--maxlength', type=int, default=150)
+    parser.add_argument('-d', '--data', metavar='DATA', default='twitter', choices=['weibo', 'twitter', 'finefake'],
+                        help='dataset: weibo, twitter, finefake')
+    parser.add_argument('--maxlength', type=int, default=512)
     parser.add_argument("--split", type=float, default=0.8)
     parser.add_argument("--tag", type=str, default="LogicDM",
                         help="the tags for comet")
@@ -84,6 +88,26 @@ def get_parser():
                         help='the maximum number of iteration in each epoch ')
     parser.add_argument('--d_rop', default=0.3, type=float,
                         help='d_rop rate of neural network model')
+    
+    # FineFake specific arguments
+    parser.add_argument('--data_dir', type=str, default='/data0/lh/misexplore/data/finefake',
+                        help='Directory containing FineFake pickle files')
+    parser.add_argument('--data_path', type=str, default=None,
+                        help='Path to FineFake pickle file (for random split mode)')
+    parser.add_argument('--train_file', type=str, default='finefake_sampled_with_evidence_train.pkl',
+                        help='Train file name (for fix mode)')
+    parser.add_argument('--test_file', type=str, default='finefake_sampled_with_evidence_test.pkl',
+                        help='Test file name (for fix mode)')
+    parser.add_argument('--val_file', type=str, default='finefake_sampled_with_evidence_val.pkl',
+                        help='Validation file name (for fix mode)')
+    parser.add_argument('--image_root_dir', type=str, default='/data0/lh/mis_data/finefake',
+                        help='Root directory for FineFake images')
+    parser.add_argument('--preprocessed_dir', type=str, default=None,
+                        help='Directory containing preprocessed FineFake data (if None, uses data_dir/preprocessed)')
+    parser.add_argument('--use_preprocessed', action='store_true', default=True,
+                        help='Use preprocessed data if available (faster)')
+    parser.add_argument('--no_preprocessed', dest='use_preprocessed', action='store_false',
+                        help='Force on-the-fly processing even if preprocessed data exists')
 
     args = parser.parse_args()
     if args.finetune in ["True", "true"]:
@@ -140,6 +164,73 @@ def main(args, experiment=None):
             train_dataset = Weibo_Set(max_length=args.maxlength, mode='fix', phase='train')
             test_dataset = Weibo_Set(max_length=args.maxlength, mode='fix', phase='test')
         ch = True
+    elif args.data == 'finefake':
+        # FineFake dataset - support preprocessed data (fast) or on-the-fly processing (slow)
+        base_data_dir = getattr(args, 'data_dir', '/data0/lh/misexplore/data/finefake')
+        image_root_dir = getattr(args, 'image_root_dir', '/data0/lh/mis_data/finefake')
+        # Handle preprocessed_dir: if None or not provided, use default
+        preprocessed_dir_arg = getattr(args, 'preprocessed_dir', None)
+        if preprocessed_dir_arg is None:
+            preprocessed_dir = os.path.join(base_data_dir, 'preprocessed')
+        else:
+            preprocessed_dir = preprocessed_dir_arg
+        
+        # Check if preprocessed data exists
+        use_preprocessed = getattr(args, 'use_preprocessed', True)
+        train_text_path = os.path.join(preprocessed_dir, 'finefake_train.json')
+        train_img_path = os.path.join(preprocessed_dir, 'finefake_train_images.pt')
+        val_text_path = os.path.join(preprocessed_dir, 'finefake_val.json')
+        val_img_path = os.path.join(preprocessed_dir, 'finefake_val_images.pt')
+        test_text_path = os.path.join(preprocessed_dir, 'finefake_test.json')
+        test_img_path = os.path.join(preprocessed_dir, 'finefake_test_images.pt')
+        
+        if args.type == 'random':
+            # Use single file and random split
+            data_path = getattr(args, 'data_path', os.path.join(base_data_dir, 'FineFake.pkl'))
+            if data_path is None:
+                data_path = os.path.join(base_data_dir, 'FineFake.pkl')
+            dataset = FineFake_Set_V2(data_path=data_path, image_root_dir=image_root_dir, 
+                                     max_length=args.maxlength, language='english')
+            train_size = int(len(dataset) * args.split)
+            test_size = len(dataset) - train_size
+            train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+        else:
+            # Use separate train/val/test files
+            train_file = getattr(args, 'train_file', 'finefake_sampled_with_evidence_train.pkl')
+            val_file = getattr(args, 'val_file', 'finefake_sampled_with_evidence_val.pkl')
+            test_file = getattr(args, 'test_file', 'finefake_sampled_with_evidence_test.pkl')
+            
+            if use_preprocessed and os.path.exists(train_text_path) and os.path.exists(train_img_path) and \
+               os.path.exists(val_text_path) and os.path.exists(val_img_path) and \
+               os.path.exists(test_text_path) and os.path.exists(test_img_path):
+                # Use preprocessed data (fast path)
+                print("Using preprocessed data (fast path)...")
+                train_dataset = FineFake_Set_V2(text_path=train_text_path, img_path=train_img_path,
+                                               max_length=args.maxlength, language='english')
+                val_dataset = FineFake_Set_V2(text_path=val_text_path, img_path=val_img_path,
+                                             max_length=args.maxlength, language='english')
+                test_dataset = FineFake_Set_V2(text_path=test_text_path, img_path=test_img_path,
+                                              max_length=args.maxlength, language='english')
+            else:
+                # Use pickle files and process on-the-fly (slow path)
+                print("Using pickle files (on-the-fly processing, slower)...")
+                
+                train_data_path = os.path.join(base_data_dir, train_file)
+                val_data_path = os.path.join(base_data_dir, val_file)
+                test_data_path = os.path.join(base_data_dir, test_file)
+                
+                train_dataset = FineFake_Set_V2(data_path=train_data_path, image_root_dir=image_root_dir,
+                                               max_length=args.maxlength, language='english')
+                # Check if val file exists, if not, skip validation set
+                if os.path.exists(val_data_path):
+                    val_dataset = FineFake_Set_V2(data_path=val_data_path, image_root_dir=image_root_dir,
+                                                 max_length=args.maxlength, language='english')
+                else:
+                    print(f"Warning: Validation file {val_data_path} not found, using test set for validation")
+                    val_dataset = None
+                test_dataset = FineFake_Set_V2(data_path=test_data_path, image_root_dir=image_root_dir,
+                                              max_length=args.maxlength, language='english')
+        ch = False  # English dataset
     # if dataset is None:
     #     ch = None
     #     print("error dataset parameter")
@@ -149,10 +240,18 @@ def main(args, experiment=None):
     # test_size = len(dataset) - train_size
     # train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-    print(len(train_dataset))
-    print(len(test_dataset))
+    print(f"Train dataset size: {len(train_dataset)}")
+    if 'val_dataset' in locals() and val_dataset is not None:
+        print(f"Validation dataset size: {len(val_dataset)}")
+    else:
+        # If no validation set, use test set for validation (but keep test set separate)
+        val_dataset = test_dataset
+        print(f"Using test set as validation (size: {len(val_dataset)})")
+    print(f"Test dataset size: {len(test_dataset)}")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=PadCollate(ch=ch, graph_type=args.graphtype), num_workers=args.workers, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=False, collate_fn=PadCollate(ch=ch, graph_type=args.graphtype), num_workers=args.workers,
+                                     shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False, collate_fn=PadCollate(ch=ch, graph_type=args.graphtype), num_workers=args.workers,
                                      shuffle=False)
 
@@ -165,7 +264,7 @@ def main(args, experiment=None):
     optimizer = optim.Adam(params=parameters, lr=args.lr, betas=(0.9, 0.999), eps=1e-8,
                            weight_decay=args.wd,
                            amsgrad=True)
-    lr_scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=args.patience, verbose=True)
+    lr_scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=args.patience)
 
     if args.phase != 'train':
         pass
@@ -180,7 +279,11 @@ def main(args, experiment=None):
     """
 
     if args.phase == 'test':
-        test_loss, metrics_test = validate(test_loader, RFND_Model, args, device)
+        test_loss, metrics_test, test_labels, test_predictions = validate(test_loader, RFND_Model, args, device, phase='TEST')
+        # Print confusion matrix for test phase
+        cm = confusion_matrix(test_labels, test_predictions)
+        print('\nConfusion Matrix:')
+        print(cm)
         return test_loss, metrics_test
 
     # start training
@@ -188,13 +291,20 @@ def main(args, experiment=None):
     acc1_store = []
     best_metric = None
     prefix = "seed-" + str(args.seed)
+    print(f"\n{'='*80}")
+    print(f"Starting training for {args.epochs} epochs")
+    print(f"{'='*80}\n")
     for epoch in range(args.epochs):
+        print(f"\n[Epoch {epoch+1}/{args.epochs}]")
+        print("-" * 80)
         # train for one epoch
-        # evaluate on validation set
         train_loss, metrics_train = train_model(dataloader=train_loader, model=RFND_Model, optimizer=optimizer,
                                                 epoch=epoch, args=args)
+        # evaluate on validation set
         # [acc, r_sarcasm, p_sarcasm, f1_sarcasm, r_non_sarcasm, p_non_sarcasm, f1_non_sarcasm]
-        test_loss, metrics_test = validate(test_loader, RFND_Model, args=args, device=device)
+        val_loss, metrics_val, _, _ = validate(val_loader, RFND_Model, args=args, device=device, phase='VAL')
+        # evaluate on test set
+        test_loss, metrics_test, _, _ = validate(test_loader, RFND_Model, args=args, device=device, phase='TEST')
         train_metircs = {prefix + "-train_acc": metrics_train[0], prefix + "-train_loss": float(train_loss),
                           prefix + "-train_r_romor": metrics_train[1], prefix + "-train_p_rumor": metrics_train[2],
                           prefix + "-train_f1_romor": metrics_train[3], prefix + "-train_r_non_rumor": metrics_train[4],
@@ -205,8 +315,10 @@ def main(args, experiment=None):
                           prefix + "-test_f1_romor": metrics_test[3], prefix + "-test_r_non_rumor": metrics_test[4],
                           prefix + "-test_p_non_romor": metrics_test[5], prefix + "-test_f1_non_rumor": metrics_test[6]
                           }
-        experiment.log_metrics(train_metircs, epoch=epoch)
-        experiment.log_metrics(test_metircs, epoch=epoch)
+        # Removed comet.ml logging
+        if experiment is not None:
+            experiment.log_metrics(train_metircs, epoch=epoch)
+            experiment.log_metrics(test_metircs, epoch=epoch)
 
         # f1_store.append(float(f1_target))
         # acc1_store.append(metrics_test[0])
@@ -218,18 +330,77 @@ def main(args, experiment=None):
             # shutil.copy(logger.get_checkpoint_path('latest'), logger.get_checkpoint_path('best'))
             best_metric = metrics_test
         best_acc1 = max(metrics_test[0], best_acc1)
-    print("best_acc1 = {:.4f}".format(best_acc1))
+        print(f"  Best Acc so far: {best_acc1:.4f}\n", flush=True)
+    print(f"\n{'='*80}")
+    print(f"Training completed! Best Accuracy: {best_acc1:.4f}")
+    print(f"{'='*80}\n")
+
+    # Final test with best model and output confusion matrix
+    print(f"\n{'='*80}")
+    print("Final Test Results:")
+    print(f"{'='*80}\n")
+    final_test_loss, final_test_metrics, final_test_labels, final_test_predictions = validate(
+        test_loader, RFND_Model, args=args, device=device, phase='TEST'
+    )
+    
+    # Print confusion matrix
+    cm = confusion_matrix(final_test_labels, final_test_predictions)
+    print('\nConfusion Matrix:')
+    print(cm)
+    print(f"{'='*80}\n")
+
+    # Save test results to JSON
+    output_dir = os.path.join('./checkpoints', args.log)
+    os.makedirs(output_dir, exist_ok=True)
+    test_results_path = os.path.join(output_dir, 'test_results.json')
+    avg_test_loss = final_test_loss / len(test_loader) if len(test_loader) > 0 else 0.0
+    save_results_to_json(final_test_metrics, avg_test_loss, test_results_path, phase='TEST')
 
     final_best_metircs = {prefix + "-best_acc": best_metric[0],
                     prefix + "-best_r_romor": best_metric[1], prefix + "-best_p_rumor": best_metric[2],
                     prefix + "-best_f1_romor": best_metric[3], prefix + "-best_r_non_rumor": best_metric[4],
                     prefix + "-best_p_non_romor": best_metric[5], prefix + "-best_f1_non_rumor": best_metric[6]
                     }
-    experiment.log_metrics(final_best_metircs)
+    # Removed comet.ml logging
+    if experiment is not None:
+        experiment.log_metrics(final_best_metircs)
     return best_metric
 
 
-def validate(dataloader, model, args, device):
+def save_results_to_json(metrics_result, loss, output_path, phase='TEST'):
+    """
+    Save evaluation results to JSON file
+    
+    Args:
+        metrics_result: List from all_metrics [acc, r_rumor, p_rumor, f1_rumor, r_non_rumor, p_non_rumor, f1_non_rumor]
+        loss: Average loss value
+        output_path: Path to save JSON file
+        phase: Phase name (TEST/VAL)
+    """
+    json_results = {
+        'phase': phase,
+        'loss': float(loss),
+        'accuracy': float(metrics_result[0]),
+        'rumor': {
+            'recall': float(metrics_result[1]),
+            'precision': float(metrics_result[2]),
+            'f1': float(metrics_result[3])
+        },
+        'non_rumor': {
+            'recall': float(metrics_result[4]),
+            'precision': float(metrics_result[5]),
+            'f1': float(metrics_result[6])
+        },
+        'macro_f1': float((metrics_result[3] + metrics_result[6]) / 2.0)
+    }
+    
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(json_results, f, indent=2, ensure_ascii=False)
+    print(f'Results saved to: {output_path}')
+
+
+def validate(dataloader, model, args, device, phase='VAL'):
     model.eval()
     end = time.time()
     real_labels = []
@@ -254,25 +425,35 @@ def validate(dataloader, model, args, device):
                                    word_len=word_len,  word_spans=word_spans)
             # N, 2
             probability = calculate_probability(gc_clause_list, args.hop, args.normtype)
-            final_test_loss = final_test_loss + F.cross_entropy(probability, labels).item()
+            
+            # Ensure probability is valid
+            probability = F.softmax(probability, dim=1)
+            probability = torch.clamp(probability, min=1e-8, max=1.0 - 1e-8)
+            logits = torch.log(probability / (1 - probability + 1e-8) + 1e-8)
+            
+            test_loss_batch = F.cross_entropy(logits, labels)
+            if not (torch.isnan(test_loss_batch) or torch.isinf(test_loss_batch)):
+                final_test_loss = final_test_loss + test_loss_batch.item()
             real_labels = real_labels + labels.cpu().detach().clone().numpy().tolist()
             # the [1] is score
             predicted_labels = predicted_labels + (probability[:, 0] < probability[:, 1]).cpu().long().numpy().tolist()
             torch.cuda.empty_cache()
     period = time.time() - end
-    metrics_test = all_metrics(real_labels, predicted_labels)
+    metrics_result = all_metrics(real_labels, predicted_labels)
     # [acc, r_sarcasm, p_sarcasm, f1_sarcasm, r_non_sarcasm, p_non_sarcasm, f1_non_sarcasm]
-    print("Test: Time: {:.4f}, Acc: {:.4f}, Loss: {:.4f}, Rumor_R: {:.4f}, Rumor_P: {:.4f}, "
-          "Rumor_F: {:.4f}, Non_Rumor_R: {:.4f}, Non_Rumor_P: {:.4f}, Non_Rumor_F1: {:.4f}".format(period,
-                                                                                               metrics_test[0],
-                                                                                               final_test_loss/(len(dataloader)),
-                                                                                               metrics_test[1],
-                                                                                               metrics_test[2],
-                                                                                               metrics_test[3],
-                                                                                               metrics_test[4],
-                                                                                               metrics_test[5],
-                                                                                               metrics_test[6]))
-    return final_test_loss, metrics_test
+    avg_loss = final_test_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    
+    # Calculate macro F1: average of F1 scores for both classes
+    macro_f1 = (metrics_result[3] + metrics_result[6]) / 2.0
+    
+    print(f"\n[{phase}]  Time: {period:.4f}s, Loss: {avg_loss:.4f}, Acc: {metrics_result[0]*100:.4f}%, Macro-F1: {macro_f1*100:.4f}%", flush=True)
+    print("  Rumor   - Recall: {:.4f}, Precision: {:.4f}, F1: {:.4f}".format(
+        metrics_result[1], metrics_result[2], metrics_result[3]), flush=True)
+    print("  Non-Rumor - Recall: {:.4f}, Precision: {:.4f}, F1: {:.4f}".format(
+        metrics_result[4], metrics_result[5], metrics_result[6]), flush=True)
+    
+    # Return predictions and labels for confusion matrix calculation
+    return final_test_loss, metrics_result, real_labels, predicted_labels
 
 
 def train_model(dataloader, model, optimizer, epoch, args):
@@ -294,17 +475,71 @@ def train_model(dataloader, model, optimizer, epoch, args):
         gc_clause_list = model(imgs=imgs, encoded_texts=encoded_texts,  mask_batch_T=mask_batch_text, mask_batch_TT=mask_T_T,
                 mask_batch_TV=mask_T_V, adj_matrix=adj_matrix,
                                word_len=word_len,  word_spans=word_spans)
+        
+        # Check for NaN in model output
+        for idx, gc_clause in enumerate(gc_clause_list):
+            if torch.isnan(gc_clause).any() or torch.isinf(gc_clause).any():
+                print(f"Warning: NaN/Inf detected in gc_clause_list[{idx}] at batch {i}")
+                print(f"  gc_clause[{idx}] stats: min={gc_clause.min().item():.6f}, max={gc_clause.max().item():.6f}")
+                print(f"  contains NaN: {torch.isnan(gc_clause).any().item()}, Inf: {torch.isinf(gc_clause).any().item()}")
+                # Skip this batch
+                continue
+        
         # N, 2
         probability = calculate_probability(gc_clause_list, args.hop, args.normtype)
+        
+        # Check for NaN or Inf values in probability
+        if torch.isnan(probability).any() or torch.isinf(probability).any():
+            print(f"Warning: NaN or Inf detected in probability at batch {i}")
+            print(f"  probability stats: min={probability.min().item():.6f}, max={probability.max().item():.6f}")
+            print(f"  probability contains NaN: {torch.isnan(probability).any().item()}")
+            print(f"  probability contains Inf: {torch.isinf(probability).any().item()}")
+            print(f"  gc_clause_list stats:")
+            for idx, gc_clause in enumerate(gc_clause_list):
+                print(f"    gc_clause[{idx}]: min={gc_clause.min().item():.6f}, max={gc_clause.max().item():.6f}")
+            # Skip this batch
+            continue
+        
+        # Ensure probability is valid (clamp to avoid extreme values and normalize)
+        # Apply softmax to ensure it's a valid probability distribution
+        probability = F.softmax(probability, dim=1)
+        # Clamp to avoid numerical instability
+        probability = torch.clamp(probability, min=1e-8, max=1.0 - 1e-8)
+        
         # train_loss = F.cross_entropy(probability, labels)
         # introduce another kind of loss
-        train_loss = F.cross_entropy(probability, labels) +\
-                     F.cross_entropy(torch.stack([probability[:, 0], (1-probability)[:, 0]], dim=1), labels) + \
-                     F.cross_entropy(torch.stack([(1 - probability)[:, 1], probability[:, 1]], dim=1), labels)
-
+        # Fix: use logits for cross_entropy (it applies log_softmax internally)
+        # Convert probability to logits for numerical stability
+        logits = torch.log(probability / (1 - probability + 1e-8) + 1e-8)
+        
+        # Original loss computation (but using logits)
+        loss1 = F.cross_entropy(logits, labels)
+        
+        # Fixed: correct way to create complementary probabilities
+        # For class 0: [prob_class0, 1-prob_class0]
+        prob_class0_complement = torch.stack([probability[:, 0], 1 - probability[:, 0]], dim=1)
+        logits_class0 = torch.log(prob_class0_complement / (1 - prob_class0_complement + 1e-8) + 1e-8)
+        loss2 = F.cross_entropy(logits_class0, labels)
+        
+        # For class 1: [1-prob_class1, prob_class1]
+        prob_class1_complement = torch.stack([1 - probability[:, 1], probability[:, 1]], dim=1)
+        logits_class1 = torch.log(prob_class1_complement / (1 - prob_class1_complement + 1e-8) + 1e-8)
+        loss3 = F.cross_entropy(logits_class1, labels)
+        
+        train_loss = loss1 + loss2 + loss3
+        
+        # Check for NaN in loss
+        if torch.isnan(train_loss) or torch.isinf(train_loss):
+            print(f"Warning: NaN or Inf detected in loss at batch {i}, skipping")
+            print(f"  loss1={loss1.item():.6f}, loss2={loss2.item():.6f}, loss3={loss3.item():.6f}")
+            continue
 
         optimizer.zero_grad()
         train_loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         final_train_loss = final_train_loss + train_loss.item()
         real_labels = real_labels + labels.cpu().detach().clone().numpy().tolist()
@@ -314,10 +549,13 @@ def train_model(dataloader, model, optimizer, epoch, args):
     period = time.time() - end
     metrics_train = all_metrics(real_labels, predicted_labels)
         # [acc, r_sarcasm, p_sarcasm, f1_sarcasm, r_non_sarcasm, p_non_sarcasm, f1_non_sarcasm]
-    print("Train Epoch {}: Time {:.4f}, Acc: {:.4f}, Loss: {:.4f}, Rumor_R: {:.4f}, Rumor_P: {:.4f}, "
-              "Rumor_F: {:.4f}, Non_Rumor_R: {:.4f}, Non_Rumor_P: {:.4f}, Non_Rumor_F1: {:.4f}".format(epoch, period,
-        metrics_train[0], final_train_loss/(len(dataloader)), metrics_train[1],  metrics_train[2], metrics_train[3],
-        metrics_train[4],  metrics_train[5], metrics_train[6]))
+    avg_loss = final_train_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    print("\n[TRAIN] Epoch {}: Time {:.4f}s, Loss: {:.4f}, Acc: {:.4f}%".format(
+        epoch, period, avg_loss, metrics_train[0] * 100), flush=True)
+    print("  Rumor   - Recall: {:.4f}, Precision: {:.4f}, F1: {:.4f}".format(
+        metrics_train[1], metrics_train[2], metrics_train[3]), flush=True)
+    print("  Non-Rumor - Recall: {:.4f}, Precision: {:.4f}, F1: {:.4f}".format(
+        metrics_train[4], metrics_train[5], metrics_train[6]), flush=True)
 
     return final_train_loss, metrics_train
 
@@ -325,29 +563,9 @@ def train_model(dataloader, model, optimizer, epoch, args):
 if __name__ == '__main__':
     # must record every result
     args = get_parser()
-    experiment = Experiment(
-        api_key="",
-        project_name="",
-        workspace="",
-    )
-    experiment.set_name("LogicDM"+str(args.data) + str(args.lr) + str(args.log))
-    experiment.add_tag(args.tag)
-    experiment.log_parameters(
-        {
-            "lr": args.lr,
-            "split": args.split,
-            "epochs": args.epochs,
-            "log": args.log,
-            "sizeclues": args.sizeclues,
-            "topk": args.topk,
-            "threshold": args.threshold,
-            "rate": args.rate,
-            "hop": args.hop,
-            "finetune": args.finetune,
-            "wd": args.wd
-
-        }
-    )
+    # Removed comet.ml dependency
+    experiment = None  # Set to None to disable comet.ml
+    
     acc_seeds = []
     r_rumor_seeds = []
     p_rumor_seeds = []
@@ -384,7 +602,10 @@ if __name__ == '__main__':
                           "-final_f1_romor": avg_f1_rumor, "-final_r_non_rumor": avg_r_non_rumor,
                           "-final_p_non_romor": avg_p_non_rumor, "-final_f1_non_rumor": avg_f1_non_rumor
                           }
-    experiment.log_metrics(final_best_metircs)
-    experiment.end()
+    # Removed comet.ml logging
+    if experiment is not None:
+        experiment.log_metrics(final_best_metircs)
+        experiment.end()
+    print("Final metrics:", final_best_metircs)
 
 
